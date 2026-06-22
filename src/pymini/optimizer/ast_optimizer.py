@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import ast
-import operator
-from collections.abc import Callable
+from typing import Any, cast
 
 
 def optimize_module(module: ast.Module) -> ast.Module:
@@ -50,6 +49,13 @@ class AstOptimizer(ast.NodeTransformer):
         node.body = self._prune_dead_statements([self.visit(stmt) for stmt in node.body])
         node.orelse = self._prune_dead_statements([self.visit(stmt) for stmt in node.orelse])
         if isinstance(node.test, ast.Constant) and not bool(node.test.value):
+            if node.orelse:
+                replacement = ast.If(
+                    test=ast.Constant(value=True),
+                    body=node.orelse,
+                    orelse=[],
+                )
+                return ast.copy_location(replacement, node)
             return ast.copy_location(ast.Pass(), node)
         return node
 
@@ -106,37 +112,40 @@ class AstOptimizer(ast.NodeTransformer):
         return result
 
     @staticmethod
-    def _fold_binary(op: ast.operator, left: object, right: object) -> object:
-        funcs: dict[type[ast.operator], Callable[[object, object], object]] = {
-            ast.Add: operator.add,
-            ast.Sub: operator.sub,
-            ast.Mult: operator.mul,
-            ast.Div: operator.truediv,
-            ast.FloorDiv: operator.floordiv,
-            ast.Mod: operator.mod,
-            ast.Pow: operator.pow,
-        }
-        for op_type, func in funcs.items():
-            if isinstance(op, op_type):
-                try:
-                    return func(left, right)
-                except Exception:
-                    return _NO_FOLD
+    def _fold_binary(op: ast.operator, left: object, right: object) -> Any:
+        lhs = cast(Any, left)
+        rhs = cast(Any, right)
+        try:
+            if isinstance(op, ast.Add):
+                return lhs + rhs
+            if isinstance(op, ast.Sub):
+                return lhs - rhs
+            if isinstance(op, ast.Mult):
+                return lhs * rhs
+            if isinstance(op, ast.Div):
+                return lhs / rhs
+            if isinstance(op, ast.FloorDiv):
+                return lhs // rhs
+            if isinstance(op, ast.Mod):
+                return lhs % rhs
+            if isinstance(op, ast.Pow):
+                return lhs**rhs
+        except Exception:
+            return _NO_FOLD
         return _NO_FOLD
 
     @staticmethod
-    def _fold_unary(op: ast.unaryop, value: object) -> object:
-        funcs: dict[type[ast.unaryop], Callable[[object], object]] = {
-            ast.UAdd: operator.pos,
-            ast.USub: operator.neg,
-            ast.Not: operator.not_,
-        }
-        for op_type, func in funcs.items():
-            if isinstance(op, op_type):
-                try:
-                    return func(value)
-                except Exception:
-                    return _NO_FOLD
+    def _fold_unary(op: ast.unaryop, value: object) -> Any:
+        operand = cast(Any, value)
+        try:
+            if isinstance(op, ast.UAdd):
+                return +operand
+            if isinstance(op, ast.USub):
+                return -operand
+            if isinstance(op, ast.Not):
+                return not operand
+        except Exception:
+            return _NO_FOLD
         return _NO_FOLD
 
 

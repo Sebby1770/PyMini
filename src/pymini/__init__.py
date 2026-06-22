@@ -2,22 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from pymini.api import ExecutionEngine, compile_source, evaluate, parse
+from pymini.version import VERSION as __version__
 
-if TYPE_CHECKING:
-    from pymini.api import evaluate, parse
-
-
-def parse(*args: Any, **kwargs: Any) -> object:
-    from pymini.api import parse as _parse
-
-    return _parse(*args, **kwargs)
-
-
-def evaluate(*args: Any, **kwargs: Any) -> object:
-    from pymini.api import evaluate as _evaluate
-
-    return _evaluate(*args, **kwargs)
-
-
-__all__ = ["evaluate", "parse"]
+__all__ = ["ExecutionEngine", "__version__", "compile_source", "evaluate", "parse"]

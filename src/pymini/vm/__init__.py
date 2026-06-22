@@ -1,6 +1,5 @@
-"""Virtual machine package placeholder for Milestone 2."""
+"""Experimental bytecode virtual machine."""
 
-from pymini.vm.machine import VirtualMachine
+from pymini.vm.machine import Frame, VirtualMachine
 
-__all__ = ["VirtualMachine"]
-
+__all__ = ["Frame", "VirtualMachine"]

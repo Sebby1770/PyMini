@@ -2,35 +2,56 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 from pymini.parser import ParserMode
+from pymini.runtime.errors import PyMiniError, format_error
 from pymini.runtime.evaluator import Evaluator
+from pymini.version import VERSION
 
 
-def run_repl(*, parser_mode: ParserMode = ParserMode.AST, optimize: bool = True) -> None:
-    evaluator = Evaluator()
-    buffer: list[str] = []
+def _terminal_prompt() -> Callable[[str], str]:
+    """Create the richest available terminal prompt implementation."""
 
     try:
-        from prompt_toolkit import PromptSession
-        from prompt_toolkit.lexers import PygmentsLexer
-        from pygments.lexers.python import PythonLexer
+        from prompt_toolkit import PromptSession  # type: ignore[import-not-found]
+        from prompt_toolkit.lexers import PygmentsLexer  # type: ignore[import-not-found]
+        from pygments.lexers.python import PythonLexer  # type: ignore[import-untyped]
 
         session = PromptSession(lexer=PygmentsLexer(PythonLexer))
 
-        def prompt(text: str) -> str:
-            return session.prompt(text)
+        def read_prompt(text: str) -> str:
+            return cast(str, session.prompt(text))
 
-    except Exception:
+    except ImportError:
 
-        def prompt(text: str) -> str:
+        def read_prompt(text: str) -> str:
             return input(text)
 
-    print("PyMini 0.1.0. Type Ctrl-D to exit.")
+    return read_prompt
+
+
+def run_repl(
+    *,
+    parser_mode: ParserMode = ParserMode.AST,
+    optimize: bool = True,
+    prompt: Callable[[str], str] | None = None,
+    stdout: Callable[[str], None] | None = None,
+) -> None:
+    """Run a stateful REPL with injectable I/O for embedding and tests."""
+
+    write = stdout or print
+    read = prompt or _terminal_prompt()
+    evaluator = Evaluator(stdout=write)
+    buffer: list[str] = []
+
+    write(f"PyMini {VERSION}. Type Ctrl-D to exit.")
     while True:
         try:
-            line = prompt("... " if buffer else ">>> ")
+            line = read("... " if buffer else ">>> ")
         except (EOFError, KeyboardInterrupt):
-            print()
+            write("")
             break
 
         if not line.strip() and buffer:
@@ -47,7 +68,6 @@ def run_repl(*, parser_mode: ParserMode = ParserMode.AST, optimize: bool = True)
         try:
             result = evaluator.run(source, parser_mode=parser_mode, optimize=optimize)
             if result is not None:
-                print(result)
-        except Exception as exc:
-            print(f"{exc.__class__.__name__}: {exc}")
-
+                write(str(result))
+        except PyMiniError as exc:
+            write(format_error(exc, source=source))

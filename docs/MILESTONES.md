@@ -12,10 +12,14 @@
 
 ## Milestone 2: Compiler + Bytecode VM
 
-- Design bytecode instructions and a disassembler.
-- Compile AST nodes into chunks with constants and name tables.
-- Implement stack frames, call protocol, closures, method binding, and imports.
-- Add VM tests that mirror evaluator tests.
+- [x] Define typed bytecode instructions, constants, jumps, and comparisons.
+- [x] Compile expressions, collections, subscripts, assignments, `if`, `while`, `for`,
+  loop control, short-circuit boolean operations, and bounded built-in calls.
+- [x] Implement one authoritative frame stack, runtime checks, and execution budgets.
+- [x] Add collections and human-readable disassembly.
+- [x] Add differential evaluator/VM tests for the currently compiled subset.
+- [ ] Add user functions, closures, method binding, and imports.
+- [ ] Expand differential tests as the VM subset grows.
 
 ## Milestone 3: Memory Model
 
@@ -36,4 +40,3 @@
 - Benchmark evaluator and VM against CPython.
 - Add `llvmlite` JIT experiments for hot loops.
 - Add a WebAssembly backend for a small numeric subset.
-

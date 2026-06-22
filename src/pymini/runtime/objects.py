@@ -7,8 +7,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from pymini.runtime.errors import PyMiniRuntimeError, PyMiniTypeError, ReturnSignal
+from pymini.runtime.errors import Location, PyMiniRuntimeError, PyMiniTypeError, ReturnSignal
 from pymini.runtime.scope import Environment
+
+
+def _current_location(evaluator: object) -> Location | None:
+    location = getattr(evaluator, "current_location", None)
+    return location if isinstance(location, Location) else None
 
 
 @runtime_checkable
@@ -23,7 +28,12 @@ class NativeFunction:
     func: Callable[..., object]
 
     def call(self, args: Sequence[object], evaluator: object) -> object:
-        return self.func(*args)
+        try:
+            return self.func(*args)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise PyMiniTypeError(
+                str(exc), location=_current_location(evaluator)
+            ) from exc
 
     def __repr__(self) -> str:
         return f"<native fn {self.name}>"
@@ -44,14 +54,17 @@ class MiniFunction:
 
         parameters = self.declaration.args.args
         if len(args) > len(parameters):
-            raise PyMiniTypeError(
-                f"{self.name} expected at most {len(parameters)} arguments, got {len(args)}"
+            raise self._make_type_error(
+                evaluator,
+                f"{self.name} expected at most {len(parameters)} arguments, got {len(args)}",
             )
 
         missing = len(parameters) - len(args)
         if missing > len(self.defaults):
             required = len(parameters) - len(self.defaults)
-            raise PyMiniTypeError(f"{self.name} expected at least {required} arguments")
+            raise self._make_type_error(
+                evaluator, f"{self.name} expected at least {required} arguments"
+            )
 
         bound = list(args)
         if missing:
@@ -72,6 +85,12 @@ class MiniFunction:
 
     def __repr__(self) -> str:
         return f"<fn {self.name}>"
+
+    @staticmethod
+    def _make_type_error(evaluator: object, message: str) -> PyMiniTypeError:
+        """Attach the evaluator's current location when available."""
+
+        return PyMiniTypeError(message, location=_current_location(evaluator))
 
 
 @dataclass(slots=True)
@@ -117,7 +136,7 @@ class MiniClass:
             initializer = None
         if initializer is not None:
             if not isinstance(initializer, BoundMethod):
-                raise PyMiniTypeError("__init__ must be a method")
+                raise MiniFunction._make_type_error(evaluator, "__init__ must be a method")
             initializer.call(args, evaluator)
         return instance
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from pymini.runtime.errors import PyMiniNameError
 from pymini.runtime.objects import ModuleNamespace, NativeFunction
+from pymini.version import VERSION
 
 
 def _wrap_function(name: str, func: Callable[..., object]) -> NativeFunction:
@@ -40,7 +41,7 @@ class StandardLibrary:
                 "pymini": ModuleNamespace(
                     "pymini",
                     {
-                        "version": "0.1.0",
+                        "version": VERSION,
                     },
                 ),
             }
@@ -51,4 +52,3 @@ class StandardLibrary:
         if root not in self.modules:
             raise PyMiniNameError(f"module {name!r} is not available in PyMini stdlib")
         return self.modules[root]
-
