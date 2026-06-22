@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import cast
 
 from pymini.parser import ParserMode
 from pymini.runtime.errors import PyMiniError, format_error
@@ -15,14 +14,14 @@ def _terminal_prompt() -> Callable[[str], str]:
     """Create the richest available terminal prompt implementation."""
 
     try:
-        from prompt_toolkit import PromptSession  # type: ignore[import-not-found]
-        from prompt_toolkit.lexers import PygmentsLexer  # type: ignore[import-not-found]
-        from pygments.lexers.python import PythonLexer  # type: ignore[import-untyped]
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.lexers import PygmentsLexer
+        from pygments.lexers.python import PythonLexer
 
-        session = PromptSession(lexer=PygmentsLexer(PythonLexer))
+        session: PromptSession[str] = PromptSession(lexer=PygmentsLexer(PythonLexer))
 
         def read_prompt(text: str) -> str:
-            return cast(str, session.prompt(text))
+            return str(session.prompt(text))
 
     except ImportError:
 

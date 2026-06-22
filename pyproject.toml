@@ -62,3 +62,7 @@ python_version = "3.11"
 strict = true
 mypy_path = "src"
 packages = ["pymini"]
+
+[[tool.mypy.overrides]]
+module = ["prompt_toolkit", "prompt_toolkit.*", "pygments.lexers.python"]
+ignore_missing_imports = true

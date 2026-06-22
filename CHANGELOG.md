@@ -34,6 +34,8 @@ All notable changes to this project will be documented here. The format follows
 
 ### Fixed
 
+- Kept strict typing portable between minimal local environments and CI environments with
+  installed prompt-toolkit/Pygments type information.
 - Corrected `for`/`while ... else`, `break`, and `continue` semantics.
 - Reset execution budgets between runs while preserving stateful REPL globals.
 - Corrected duplicate-edge refcounts, zero-refcount cascades, and cycle collection.
