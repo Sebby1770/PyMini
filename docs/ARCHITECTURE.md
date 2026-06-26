@@ -59,8 +59,10 @@ flowchart LR
 `ast.Module` is the single interchange format. `pymini.pipeline.prepare_module`
 owns parsing and optimization, so the public API, CLI, evaluator, and VM cannot drift
 into separate frontend behavior. The evaluator implements the broad Milestone 1 subset.
-The experimental compiler validates its narrower subset while emitting bytecode; the VM
-uses one frame-owned operand stack and resets its execution budget for every run.
+The experimental compiler validates its narrower subset while emitting bytecode, including
+collection construction, subscript load/store, sequence unpacking, loop control, and the
+documented comparison operators. The VM uses one frame-owned operand stack and resets its
+execution budget for every run.
 The evaluator resolves each AST node type once and caches its bound handler for subsequent
 dispatch, retaining source-aware errors without repeated reflective lookup in hot loops.
 The evaluator and VM install builtins from one registry so their callable allow-list and

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -115,10 +115,31 @@ class VirtualMachine:
             for mapping_index in range(0, len(items), 2):
                 mapping[items[mapping_index]] = items[mapping_index + 1]
             frame.stack.append(mapping)
+        elif opcode is OpCode.UNPACK_SEQUENCE:
+            expected = self._int_operand(instruction)
+            value = self._pop(frame, instruction)
+            if expected < 0:
+                raise self._runtime_error(instruction, "unpack count cannot be negative")
+            if not isinstance(value, Sequence):
+                raise PyMiniTypeError(
+                    "cannot unpack non-sequence value",
+                    location=self._location(instruction),
+                )
+            if len(value) != expected:
+                raise PyMiniTypeError(
+                    "unpack target length does not match value length",
+                    location=self._location(instruction),
+                )
+            frame.stack.extend(reversed(value))
         elif opcode is OpCode.BINARY_SUBSCR:
             subscript_index = self._pop(frame, instruction)
             container = cast(Any, self._pop(frame, instruction))
             frame.stack.append(container[subscript_index])
+        elif opcode is OpCode.STORE_SUBSCR:
+            subscript_index = self._pop(frame, instruction)
+            container = cast(Any, self._pop(frame, instruction))
+            value = self._pop(frame, instruction)
+            container[subscript_index] = value
         elif opcode is OpCode.GET_ITER:
             frame.stack.append(iter(cast(Any, self._pop(frame, instruction))))
         elif opcode is OpCode.FOR_ITER:
@@ -231,6 +252,14 @@ class VirtualMachine:
                 return bool(lhs > rhs)
             if comparison is CompareOp.GT_E:
                 return bool(lhs >= rhs)
+            if comparison is CompareOp.IS:
+                return left is right
+            if comparison is CompareOp.IS_NOT:
+                return left is not right
+            if comparison is CompareOp.IN:
+                return bool(lhs in rhs)
+            if comparison is CompareOp.NOT_IN:
+                return bool(lhs not in rhs)
         except TypeError as exc:
             raise PyMiniTypeError(
                 str(exc), location=self._location(instruction)

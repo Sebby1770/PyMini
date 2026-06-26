@@ -104,9 +104,10 @@ PYTHONPATH=src python -m pymini -c "def make(x):\n    def add(y):\n        retur
 
 - `evaluator` is the default and supports the documented Milestone 1 language subset.
 - `vm` is an experimental, bounded stack machine for constants, names, collections,
-  subscripting, arithmetic, comparisons, boolean short-circuiting, calls to the built-in
-  allow-list, `if`, `while`, `for`, `break`, and `continue`. Unsupported syntax fails
-  during compilation before bytecode execution.
+  subscripting, subscript assignment, sequence unpacking, arithmetic, comparisons,
+  boolean short-circuiting, calls to the built-in allow-list, `if`, `while`, `for`,
+  `break`, and `continue`. Unsupported syntax fails during compilation before bytecode
+  execution.
 
 Both engines share one parse-and-optimize pipeline and enforce a configurable execution
 step budget. They also use one bounded builtin registry, including identical injectable

@@ -17,7 +17,9 @@ class OpCode(Enum):
     BUILD_LIST = auto()
     BUILD_TUPLE = auto()
     BUILD_MAP = auto()
+    UNPACK_SEQUENCE = auto()
     BINARY_SUBSCR = auto()
+    STORE_SUBSCR = auto()
     GET_ITER = auto()
     FOR_ITER = auto()
 
@@ -50,6 +52,10 @@ class CompareOp(IntEnum):
     LT_E = 3
     GT = 4
     GT_E = 5
+    IS = 6
+    IS_NOT = 7
+    IN = 8
+    NOT_IN = 9
 
 
 @dataclass(frozen=True, slots=True)

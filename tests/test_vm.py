@@ -64,6 +64,31 @@ total
     assert run_vm(break_source) == 1
 
 
+def test_vm_executes_subscript_assignment_and_unpacking() -> None:
+    source = """
+items = [1, 2, 3]
+items[1] = 20
+first, second, third = items
+nested = [0]
+nested[0] += second
+first + nested[0] + third
+"""
+
+    assert run_vm(source) == 24
+
+
+def test_vm_executes_identity_and_membership_comparisons() -> None:
+    source = """
+is_none = None is None
+not_none = 1 is not None
+contains = 2 in [1, 2, 3]
+missing = "x" not in {"answer": 42}
+is_none and not_none and contains and missing
+"""
+
+    assert run_vm(source) is True
+
+
 def test_vm_rejects_unsupported_syntax_before_execution() -> None:
     with pytest.raises(PyMiniNotImplementedError, match="FunctionDef statements"):
         run_vm("x = 1\ndef f():\n    return x")

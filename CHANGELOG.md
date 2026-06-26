@@ -12,6 +12,8 @@ All notable changes to this project will be documented here. The format follows
 - A typed bytecode compiler, human-readable disassembler, and bounded stack VM with
   control flow, collections, subscripting, iteration, loop control, built-in calls,
   and source-aware errors.
+- VM support for subscript assignment, sequence unpacking, augmented subscript assignment,
+  identity comparisons, and membership comparisons.
 - Detailed CLI/REPL diagnostics, bytecode tests, runtime semantic tests, and GC tests.
 - Centralized runtime version metadata and GitHub Actions verification.
 - `@Sebby1770` code ownership and grouped Dependabot updates.
@@ -25,6 +27,8 @@ All notable changes to this project will be documented here. The format follows
 ### Changed
 
 - The VM now uses one frame-owned operand stack and validates every instruction operand.
+- The compiler and VM now cover more of the evaluator's collection and comparison semantics
+  under differential conformance tests.
 - The GC simulator now enforces refcount invariants, cascading release, and rooted tracing.
 - Architecture and milestones now distinguish implemented engines from roadmap work.
 - Evaluator diagnostics materialize source locations lazily to protect the hot path.

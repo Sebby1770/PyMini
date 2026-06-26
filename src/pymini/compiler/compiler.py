@@ -247,14 +247,35 @@ class Compiler:
             self.chunk.patch_jump(jump, end)
 
     def _compile_load(self, node: ast.expr) -> None:
-        if not isinstance(node, ast.Name):
-            self._unsupported(node, "complex load targets")
-        self.chunk.emit(OpCode.LOAD_NAME, node.id, line=node.lineno)
+        if isinstance(node, ast.Name):
+            self.chunk.emit(OpCode.LOAD_NAME, node.id, line=node.lineno)
+            return
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.slice, ast.Slice):
+                self._unsupported(node, "slice load targets")
+            self._compile_expr(node.value)
+            self._compile_expr(node.slice)
+            self.chunk.emit(OpCode.BINARY_SUBSCR, line=node.lineno)
+            return
+        self._unsupported(node, "complex load targets")
 
     def _compile_store(self, node: ast.expr) -> None:
-        if not isinstance(node, ast.Name):
-            self._unsupported(node, "complex assignment targets")
-        self.chunk.emit(OpCode.STORE_NAME, node.id, line=node.lineno)
+        if isinstance(node, ast.Name):
+            self.chunk.emit(OpCode.STORE_NAME, node.id, line=node.lineno)
+            return
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.slice, ast.Slice):
+                self._unsupported(node, "slice assignment targets")
+            self._compile_expr(node.value)
+            self._compile_expr(node.slice)
+            self.chunk.emit(OpCode.STORE_SUBSCR, line=node.lineno)
+            return
+        if isinstance(node, ast.Tuple | ast.List):
+            self.chunk.emit(OpCode.UNPACK_SEQUENCE, len(node.elts), line=node.lineno)
+            for element in node.elts:
+                self._compile_store(element)
+            return
+        self._unsupported(node, "complex assignment targets")
 
     def _emit_constant(self, value: object, *, line: int | None = None) -> None:
         self.chunk.emit(OpCode.LOAD_CONST, self.chunk.add_constant(value), line=line)
@@ -282,6 +303,10 @@ class Compiler:
             ast.LtE: CompareOp.LT_E,
             ast.Gt: CompareOp.GT,
             ast.GtE: CompareOp.GT_E,
+            ast.Is: CompareOp.IS,
+            ast.IsNot: CompareOp.IS_NOT,
+            ast.In: CompareOp.IN,
+            ast.NotIn: CompareOp.NOT_IN,
         }
         comparison = mapping.get(type(op))
         if comparison is None:
