@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable
+from typing import TypeVar
 
 from pymini.parser.lexer import Lexer, Token, TokenKind
 from pymini.runtime.errors import PyMiniSyntaxError
+
+AstNode = TypeVar("AstNode", bound=ast.AST)
 
 
 class HandwrittenParser:
@@ -17,6 +20,14 @@ class HandwrittenParser:
         self.current = 0
         self.lexer = Lexer()
 
+    def _attach_location(self, node: AstNode, token: Token | None = None) -> AstNode:
+        """Attach source location from the current or given token."""
+        if token is None:
+            token = self._peek()
+        node.lineno = token.line  # type: ignore[attr-defined]
+        node.col_offset = max(0, token.column - 1)  # type: ignore[attr-defined]
+        return node
+
     def parse(self, source: str) -> ast.Module:
         self.tokens = self.lexer.tokenize(source)
         self.current = 0
@@ -26,7 +37,9 @@ class HandwrittenParser:
             body.append(self._statement())
             self._skip_newlines()
         module = ast.Module(body=body, type_ignores=[])
-        return ast.fix_missing_locations(module)
+        fixed = ast.fix_missing_locations(module)
+        assert isinstance(fixed, ast.Module)
+        return fixed
 
     def _statement(self) -> ast.stmt:
         if self._match_keyword("if"):
@@ -78,7 +91,8 @@ class HandwrittenParser:
         return ast.For(target=target, iter=iterable, body=body, orelse=[], type_comment=None)
 
     def _function_definition(self) -> ast.FunctionDef:
-        name = self._consume(TokenKind.NAME, "expected function name").value
+        name_token = self._consume(TokenKind.NAME, "expected function name")
+        name = name_token.value
         self._consume_op("(", "expected '(' after function name")
         parameters: list[ast.arg] = []
         if not self._check_op(")"):
@@ -98,7 +112,7 @@ class HandwrittenParser:
             kwarg=None,
             defaults=[],
         )
-        return ast.FunctionDef(
+        node = ast.FunctionDef(
             name=name,
             args=args,
             body=body,
@@ -106,9 +120,11 @@ class HandwrittenParser:
             returns=None,
             type_comment=None,
         )
+        return self._attach_location(node, name_token)
 
     def _class_definition(self) -> ast.ClassDef:
-        name = self._consume(TokenKind.NAME, "expected class name").value
+        name_token = self._consume(TokenKind.NAME, "expected class name")
+        name = name_token.value
         bases: list[ast.expr] = []
         if self._match_op("("):
             if not self._check_op(")"):
@@ -118,13 +134,14 @@ class HandwrittenParser:
                         break
             self._consume_op(")", "expected ')' after base classes")
         body = self._suite()
-        return ast.ClassDef(
+        node = ast.ClassDef(
             name=name,
             bases=bases,
             keywords=[],
             body=body,
             decorator_list=[],
         )
+        return self._attach_location(node, name_token)
 
     def _import_statement(self) -> ast.Import:
         return ast.Import(names=self._aliases())
@@ -160,8 +177,11 @@ class HandwrittenParser:
         }
         for token, op in aug_ops.items():
             if self._match_op(token):
+                target = self._store_context(expr)
+                if not isinstance(target, (ast.Name, ast.Attribute, ast.Subscript)):
+                    raise PyMiniSyntaxError("invalid augmented assignment target")
                 return ast.AugAssign(
-                    target=self._store_context(expr),
+                    target=target,
                     op=op,
                     value=self._expression(),
                 )
@@ -203,7 +223,9 @@ class HandwrittenParser:
 
     def _not(self) -> ast.expr:
         if self._match_keyword("not"):
-            return ast.UnaryOp(op=ast.Not(), operand=self._not())
+            token = self._previous()
+            node = ast.UnaryOp(op=ast.Not(), operand=self._not())
+            return self._attach_location(node, token)
         return self._comparison()
 
     def _comparison(self) -> ast.expr:
@@ -269,6 +291,7 @@ class HandwrittenParser:
         node = self._atom()
         while True:
             if self._match_op("("):
+                token = self._previous()
                 args: list[ast.expr] = []
                 if not self._check_op(")"):
                     while True:
@@ -276,16 +299,24 @@ class HandwrittenParser:
                         if not self._match_op(","):
                             break
                 self._consume_op(")", "expected ')' after arguments")
-                node = ast.Call(func=node, args=args, keywords=[])
+                node = self._attach_location(
+                    ast.Call(func=node, args=args, keywords=[]), token
+                )
                 continue
             if self._match_op("["):
+                token = self._previous()
                 index = self._expression()
                 self._consume_op("]", "expected ']' after subscript")
-                node = ast.Subscript(value=node, slice=index, ctx=ast.Load())
+                node = self._attach_location(
+                    ast.Subscript(value=node, slice=index, ctx=ast.Load()), token
+                )
                 continue
             if self._match_op("."):
+                token = self._previous()
                 attr = self._consume(TokenKind.NAME, "expected attribute name").value
-                node = ast.Attribute(value=node, attr=attr, ctx=ast.Load())
+                node = self._attach_location(
+                    ast.Attribute(value=node, attr=attr, ctx=ast.Load()), token
+                )
                 continue
             break
         return node
@@ -302,31 +333,32 @@ class HandwrittenParser:
         if self._match_keyword("None"):
             return ast.Constant(value=None)
         if self._match(TokenKind.NAME):
-            return ast.Name(id=self._previous().value, ctx=ast.Load())
+            token = self._previous()
+            return self._attach_location(ast.Name(id=token.value, ctx=ast.Load()), token)
         if self._match_op("("):
             if self._match_op(")"):
                 return ast.Tuple(elts=[], ctx=ast.Load())
             expr = self._expression()
             if self._match_op(","):
-                items = [expr]
+                tuple_items = [expr]
                 if not self._check_op(")"):
                     while True:
-                        items.append(self._expression())
+                        tuple_items.append(self._expression())
                         if not self._match_op(","):
                             break
                 self._consume_op(")", "expected ')' after tuple")
-                return ast.Tuple(elts=items, ctx=ast.Load())
+                return ast.Tuple(elts=tuple_items, ctx=ast.Load())
             self._consume_op(")", "expected ')' after grouped expression")
             return expr
         if self._match_op("["):
-            items: list[ast.expr] = []
+            list_items: list[ast.expr] = []
             if not self._check_op("]"):
                 while True:
-                    items.append(self._expression())
+                    list_items.append(self._expression())
                     if not self._match_op(","):
                         break
             self._consume_op("]", "expected ']' after list")
-            return ast.List(elts=items, ctx=ast.Load())
+            return ast.List(elts=list_items, ctx=ast.Load())
         if self._match_op("{"):
             keys: list[ast.expr | None] = []
             values: list[ast.expr] = []

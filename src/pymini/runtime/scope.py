@@ -35,4 +35,3 @@ class Environment:
 
     def snapshot(self) -> dict[str, object]:
         return dict(self.values)
-

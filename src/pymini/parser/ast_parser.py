@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 
-from pymini.runtime.errors import PyMiniSyntaxError
+from pymini.runtime.errors import Location, PyMiniSyntaxError
 
 
 class AstParser:
@@ -14,6 +14,12 @@ class AstParser:
         try:
             return ast.parse(source)
         except SyntaxError as exc:
-            location = f" at line {exc.lineno}, column {exc.offset}" if exc.lineno else ""
-            raise PyMiniSyntaxError(f"{exc.msg}{location}") from exc
-
+            location = None
+            if exc.lineno is not None:
+                location = Location(
+                    lineno=exc.lineno,
+                    col_offset=max(0, (exc.offset or 1) - 1),
+                    end_lineno=exc.end_lineno,
+                    end_col_offset=exc.end_offset,
+                )
+            raise PyMiniSyntaxError(exc.msg, location=location, source=source) from exc

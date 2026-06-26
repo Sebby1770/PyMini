@@ -10,7 +10,7 @@ env/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.coverage
+.coverage*
 htmlcov/
 
 dist/
@@ -18,4 +18,3 @@ build/
 *.egg-info/
 
 .DS_Store
-

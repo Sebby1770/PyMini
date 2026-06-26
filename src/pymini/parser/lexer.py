@@ -107,9 +107,12 @@ class Lexer:
         return tokens
 
     @staticmethod
-    def literal_value(token: Token) -> object:
+    def literal_value(token: Token) -> str | bytes | int | float:
         if token.kind == TokenKind.STRING:
-            return ast.literal_eval(token.value)
+            value = ast.literal_eval(token.value)
+            if isinstance(value, (str, bytes)):
+                return value
+            raise PyMiniSyntaxError("string token did not produce a string literal")
         if token.kind == TokenKind.NUMBER:
             return float(token.value) if "." in token.value else int(token.value)
         raise PyMiniSyntaxError(f"token {token.kind} has no literal value")
@@ -189,4 +192,3 @@ class Lexer:
                 return index + 1
             index += 1
         raise PyMiniSyntaxError(f"unterminated string literal at line {line_number}")
-
