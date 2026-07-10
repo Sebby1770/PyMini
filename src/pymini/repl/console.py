@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pymini import __version__
 from pymini.parser import ParserMode
+from pymini.runtime.errors import PyMiniError, format_exception
 from pymini.runtime.evaluator import Evaluator
 
 
 def run_repl(*, parser_mode: ParserMode = ParserMode.AST, optimize: bool = True) -> None:
-    evaluator = Evaluator()
+    evaluator = Evaluator(filename="<repl>")
     buffer: list[str] = []
 
     try:
@@ -25,7 +27,8 @@ def run_repl(*, parser_mode: ParserMode = ParserMode.AST, optimize: bool = True)
         def prompt(text: str) -> str:
             return input(text)
 
-    print("PyMini 0.1.0. Type Ctrl-D to exit.")
+    print(f"PyMini {__version__} — educational mini-Python. Type help() or Ctrl-D to exit.")
+    print("Builtins include dis(\"code\") for bytecode disassembly.")
     while True:
         try:
             line = prompt("... " if buffer else ">>> ")
@@ -48,6 +51,7 @@ def run_repl(*, parser_mode: ParserMode = ParserMode.AST, optimize: bool = True)
             result = evaluator.run(source, parser_mode=parser_mode, optimize=optimize)
             if result is not None:
                 print(result)
+        except PyMiniError as exc:
+            print(format_exception(exc))
         except Exception as exc:
             print(f"{exc.__class__.__name__}: {exc}")
-

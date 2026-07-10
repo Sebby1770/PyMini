@@ -1,4 +1,4 @@
-"""Tree-walking evaluator for the milestone PyMini runtime."""
+"""Tree-walking evaluator for the PyMini runtime."""
 
 from __future__ import annotations
 
@@ -12,11 +12,13 @@ from pymini.parser import ParserMode, parse_source
 from pymini.runtime.errors import (
     BreakSignal,
     ContinueSignal,
+    PyMiniError,
     PyMiniNameError,
     PyMiniNotImplementedError,
     PyMiniRuntimeError,
     PyMiniTypeError,
     ReturnSignal,
+    TracebackFrame,
 )
 from pymini.runtime.objects import (
     BoundMethod,
@@ -30,6 +32,8 @@ from pymini.runtime.objects import (
 from pymini.runtime.scope import Environment
 from pymini.stdlib.modules import StandardLibrary
 
+_CONTROL_FLOW = (ReturnSignal, BreakSignal, ContinueSignal)
+
 
 class Evaluator:
     """Execute PyMini programs from AST nodes."""
@@ -40,13 +44,44 @@ class Evaluator:
         stdlib: StandardLibrary | None = None,
         stdout: Callable[[str], None] | None = None,
         max_steps: int = 100_000,
+        filename: str = "<string>",
     ) -> None:
         self.stdlib = stdlib or StandardLibrary()
         self.stdout = stdout or print
         self.max_steps = max_steps
         self.steps = 0
+        self.filename = filename
         self.global_env = Environment(name="global")
+        self.frames: list[TracebackFrame] = [
+            TracebackFrame(name="<module>", filename=filename, lineno=1)
+        ]
         self._install_builtins()
+
+    def push_frame(self, name: str, lineno: int | None = None) -> None:
+        self.frames.append(TracebackFrame(name=name, filename=self.filename, lineno=lineno))
+
+    def pop_frame(self) -> None:
+        if len(self.frames) > 1:
+            self.frames.pop()
+
+    def snapshot_frames(self) -> list[TracebackFrame]:
+        return [
+            TracebackFrame(name=f.name, filename=f.filename, lineno=f.lineno)
+            for f in self.frames
+        ]
+
+    def _set_lineno(self, node: ast.AST) -> None:
+        lineno = getattr(node, "lineno", None)
+        if lineno is not None and self.frames:
+            self.frames[-1].lineno = lineno
+
+    def _attach_frames(self, exc: BaseException) -> BaseException:
+        if isinstance(exc, PyMiniError):
+            exc.with_frames(self.snapshot_frames())
+            return exc
+        wrapped = PyMiniRuntimeError(str(exc), frames=self.snapshot_frames())
+        wrapped.__cause__ = exc
+        return wrapped
 
     def run(
         self,
@@ -62,12 +97,24 @@ class Evaluator:
 
     def eval(self, node: ast.AST, env: Environment | None = None) -> object:
         self._tick()
+        self._set_lineno(node)
         scope = env or self.global_env
         method_name = f"eval_{node.__class__.__name__}"
         method = getattr(self, method_name, None)
         if method is None:
-            raise PyMiniNotImplementedError(f"{node.__class__.__name__} is not supported yet")
-        return method(node, scope)
+            raise PyMiniNotImplementedError(
+                f"{node.__class__.__name__} is not supported yet",
+                frames=self.snapshot_frames(),
+            )
+        try:
+            return method(node, scope)
+        except _CONTROL_FLOW:
+            raise
+        except PyMiniError as exc:
+            # Attach frames once; leave user-raised Exception subclasses alone so
+            # try/except Exception in PyMini programs can match them.
+            exc.with_frames(self.snapshot_frames())
+            raise
 
     def eval_block(self, statements: Sequence[ast.stmt], env: Environment) -> object:
         result: object = None
@@ -145,8 +192,10 @@ class Evaluator:
         return result
 
     def eval_FunctionDef(self, node: ast.FunctionDef, env: Environment) -> object:
-        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs or node.args.posonlyargs:
-            raise PyMiniNotImplementedError("only simple positional parameters are supported")
+        if node.args.kwarg or node.args.kwonlyargs or node.args.posonlyargs:
+            raise PyMiniNotImplementedError(
+                "only positional parameters and *args are supported"
+            )
         defaults = tuple(self.eval(default, env) for default in node.args.defaults)
         function = MiniFunction(node.name, node, env, defaults)
         return env.define(node.name, function)
@@ -193,6 +242,126 @@ class Evaluator:
             last = env.define(alias.asname or alias.name, value)
         return last
 
+    def eval_Raise(self, node: ast.Raise, env: Environment) -> object:
+        if node.exc is None:
+            raise PyMiniRuntimeError("No active exception to re-raise")
+        exc = self.eval(node.exc, env)
+        if isinstance(exc, BaseException):
+            raise exc
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            raise exc()
+        raise PyMiniTypeError(f"exceptions must derive from BaseException, got {exc!r}")
+
+    def eval_Try(self, node: ast.Try, env: Environment) -> object:
+        result: object = None
+        pending: BaseException | None = None
+        try:
+            try:
+                result = self.eval_block(node.body, env)
+            except _CONTROL_FLOW as signal:
+                pending = signal
+            except Exception as exc:
+                handled = False
+                for handler in node.handlers:
+                    if self._exception_matches(handler, exc, env):
+                        if handler.name:
+                            env.define(handler.name, exc)
+                        try:
+                            result = self.eval_block(handler.body, env)
+                        except _CONTROL_FLOW as signal:
+                            pending = signal
+                        except Exception as handler_exc:
+                            pending = handler_exc
+                        finally:
+                            if handler.name:
+                                env.values.pop(handler.name, None)
+                        handled = True
+                        break
+                if not handled:
+                    pending = exc
+            else:
+                if pending is None and node.orelse:
+                    try:
+                        result = self.eval_block(node.orelse, env)
+                    except _CONTROL_FLOW as signal:
+                        pending = signal
+                    except Exception as exc:
+                        pending = exc
+        finally:
+            if node.finalbody:
+                try:
+                    finally_result = self.eval_block(node.finalbody, env)
+                    if result is None and pending is None:
+                        result = finally_result
+                except _CONTROL_FLOW as signal:
+                    pending = signal
+                except Exception as exc:
+                    pending = exc
+        if pending is not None:
+            raise pending
+        return result
+
+    def _exception_matches(
+        self, handler: ast.ExceptHandler, exc: BaseException, env: Environment
+    ) -> bool:
+        if handler.type is None:
+            return True
+        expected = self.eval(handler.type, env)
+        if isinstance(expected, tuple):
+            return isinstance(exc, expected)
+        if isinstance(expected, type) and issubclass(expected, BaseException):
+            return isinstance(exc, expected)
+        return False
+
+    def eval_With(self, node: ast.With, env: Environment) -> object:
+        if not node.items:
+            return self.eval_block(node.body, env)
+
+        managers: list[tuple[object, object]] = []
+        result: object = None
+        try:
+            for item in node.items:
+                manager = self.eval(item.context_expr, env)
+                enter = self.get_attribute(manager, "__enter__")
+                value = self.call_value(enter, [])
+                if item.optional_vars is not None:
+                    self.assign_target(item.optional_vars, value, env)
+                managers.append((manager, value))
+            result = self.eval_block(node.body, env)
+        except _CONTROL_FLOW as signal:
+            self._exit_managers(managers, None)
+            raise signal
+        except Exception as exc:
+            suppressed = self._exit_managers(managers, exc)
+            if not suppressed:
+                raise
+            return result
+        else:
+            self._exit_managers(managers, None)
+            return result
+
+    def _exit_managers(
+        self,
+        managers: list[tuple[object, object]],
+        exc: BaseException | None,
+    ) -> bool:
+        """Call ``__exit__`` on managers in reverse order. Return True if suppressed."""
+
+        suppressed = False
+        exc_type: object = None if exc is None else type(exc)
+        exc_val: object = exc
+        exc_tb: object = None
+        for manager, _value in reversed(managers):
+            exit_method = self.get_attribute(manager, "__exit__")
+            exit_result = self.call_value(exit_method, [exc_type, exc_val, exc_tb])
+            if exc is not None and self._truthy(exit_result):
+                suppressed = True
+                # Subsequent exits see a suppressed exception.
+                exc = None
+                exc_type = None
+                exc_val = None
+        return suppressed
+
     def eval_BinOp(self, node: ast.BinOp, env: Environment) -> object:
         return self._binary_op(node.op, self.eval(node.left, env), self.eval(node.right, env))
 
@@ -219,7 +388,7 @@ class Evaluator:
                     return result
             return result
         if isinstance(node.op, ast.Or):
-            result: object = False
+            result = False
             for value_node in node.values:
                 result = self.eval(value_node, env)
                 if self._truthy(result):
@@ -247,6 +416,9 @@ class Evaluator:
     def eval_Tuple(self, node: ast.Tuple, env: Environment) -> object:
         return tuple(self.eval(item, env) for item in node.elts)
 
+    def eval_Set(self, node: ast.Set, env: Environment) -> object:
+        return {self.eval(item, env) for item in node.elts}
+
     def eval_Dict(self, node: ast.Dict, env: Environment) -> object:
         result: dict[object, object] = {}
         for key_node, value_node in zip(node.keys, node.values, strict=True):
@@ -254,6 +426,87 @@ class Evaluator:
                 raise PyMiniNotImplementedError("dict unpacking is not supported")
             result[self.eval(key_node, env)] = self.eval(value_node, env)
         return result
+
+    def eval_ListComp(self, node: ast.ListComp, env: Environment) -> object:
+        result: list[object] = []
+        self._run_comprehension(node.generators, env, lambda local: result.append(self.eval(node.elt, local)))
+        return result
+
+    def eval_SetComp(self, node: ast.SetComp, env: Environment) -> object:
+        result: set[object] = set()
+        self._run_comprehension(node.generators, env, lambda local: result.add(self.eval(node.elt, local)))
+        return result
+
+    def eval_DictComp(self, node: ast.DictComp, env: Environment) -> object:
+        result: dict[object, object] = {}
+
+        def collect(local: Environment) -> None:
+            key = self.eval(node.key, local)
+            value = self.eval(node.value, local)
+            result[key] = value
+
+        self._run_comprehension(node.generators, env, collect)
+        return result
+
+    def eval_GeneratorExp(self, node: ast.GeneratorExp, env: Environment) -> object:
+        # Materialize as a list for simplicity (educational subset).
+        result: list[object] = []
+        self._run_comprehension(
+            node.generators, env, lambda local: result.append(self.eval(node.elt, local))
+        )
+        return iter(result)
+
+    def _run_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        env: Environment,
+        collect: Callable[[Environment], None],
+    ) -> None:
+        comp_env = Environment(name="comprehension", parent=env)
+
+        def rec(index: int) -> None:
+            if index == len(generators):
+                collect(comp_env)
+                return
+            gen = generators[index]
+            iter_env = env if index == 0 else comp_env
+            iterable = self.eval(gen.iter, iter_env)
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"object {iterable!r} is not iterable")
+            for item in iterable:
+                self.assign_target(gen.target, item, comp_env)
+                if all(self._truthy(self.eval(if_clause, comp_env)) for if_clause in gen.ifs):
+                    rec(index + 1)
+
+        rec(0)
+
+    def eval_JoinedStr(self, node: ast.JoinedStr, env: Environment) -> object:
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant):
+                parts.append("" if value.value is None else str(value.value))
+            elif isinstance(value, ast.FormattedValue):
+                parts.append(self._format_value(value, env))
+            else:
+                parts.append(str(self.eval(value, env)))
+        return "".join(parts)
+
+    def eval_FormattedValue(self, node: ast.FormattedValue, env: Environment) -> object:
+        return self._format_value(node, env)
+
+    def _format_value(self, node: ast.FormattedValue, env: Environment) -> str:
+        value = self.eval(node.value, env)
+        conversion = node.conversion
+        if conversion == ord("s"):
+            value = str(value)
+        elif conversion == ord("r"):
+            value = repr(value)
+        elif conversion == ord("a"):
+            value = ascii(value)
+        if node.format_spec is not None:
+            spec = self.eval(node.format_spec, env)
+            return format(value, str(spec))
+        return format(value)
 
     def eval_Subscript(self, node: ast.Subscript, env: Environment) -> object:
         value = self.eval(node.value, env)
@@ -267,8 +520,19 @@ class Evaluator:
         if node.keywords:
             raise PyMiniNotImplementedError("keyword arguments are not supported yet")
         callee = self.eval(node.func, env)
-        args = [self.eval(arg, env) for arg in node.args]
+        args: list[object] = []
+        for arg in node.args:
+            if isinstance(arg, ast.Starred):
+                starred = self.eval(arg.value, env)
+                if not isinstance(starred, Iterable):
+                    raise PyMiniTypeError(f"{starred!r} is not iterable")
+                args.extend(list(starred))
+            else:
+                args.append(self.eval(arg, env))
         return self.call_value(callee, args)
+
+    def eval_Starred(self, node: ast.Starred, env: Environment) -> object:
+        raise PyMiniTypeError("starred expression is not allowed here")
 
     def eval_slice(self, node: ast.AST, env: Environment) -> object:
         if isinstance(node, ast.Slice):
@@ -290,7 +554,7 @@ class Evaluator:
             receiver[index] = value  # type: ignore[index]
             return value
         if isinstance(target, ast.Tuple | ast.List):
-            if not isinstance(value, Sequence):
+            if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
                 raise PyMiniTypeError("cannot unpack non-sequence value")
             if len(target.elts) != len(value):
                 raise PyMiniTypeError("unpack target length does not match value length")
@@ -312,7 +576,10 @@ class Evaluator:
 
     def get_attribute(self, value: object, name: str) -> object:
         if isinstance(value, MiniInstance | MiniClass | ModuleNamespace):
-            return value.get_attr(name)
+            try:
+                return value.get_attr(name)
+            except AttributeError:
+                raise PyMiniNameError(f"{value!r} has no attribute {name!r}")
         try:
             return getattr(value, name)
         except AttributeError:
@@ -328,6 +595,8 @@ class Evaluator:
             return callee.call(args, self)
         if isinstance(callee, SupportsCall):
             return callee.call(args, self)
+        if callable(callee):
+            return callee(*args)
         raise PyMiniTypeError(f"object {callee!r} is not callable")
 
     def _install_builtins(self) -> None:
@@ -336,19 +605,59 @@ class Evaluator:
         self.global_env.define("range", NativeFunction("range", range))
         self.global_env.define("list", NativeFunction("list", list))
         self.global_env.define("dict", NativeFunction("dict", dict))
+        self.global_env.define("set", NativeFunction("set", set))
+        self.global_env.define("tuple", NativeFunction("tuple", tuple))
         self.global_env.define("str", NativeFunction("str", str))
         self.global_env.define("int", NativeFunction("int", int))
         self.global_env.define("float", NativeFunction("float", float))
         self.global_env.define("bool", NativeFunction("bool", bool))
+        self.global_env.define("Exception", Exception)
+        self.global_env.define("ValueError", ValueError)
+        self.global_env.define("TypeError", TypeError)
+        self.global_env.define("RuntimeError", RuntimeError)
+        self.global_env.define("ZeroDivisionError", ZeroDivisionError)
+        self.global_env.define("help", NativeFunction("help", self._help))
+        self.global_env.define("dis", NativeFunction("dis", self._dis))
 
     def _print(self, *values: object) -> None:
         self.stdout(" ".join(str(value) for value in values))
         return None
 
+    def _help(self, *values: object) -> None:
+        if not values:
+            self.stdout(
+                "PyMini help\n"
+                "  evaluate expressions, define functions/classes, use control flow.\n"
+                "  Builtins: print, len, range, list, dict, set, str, int, float, bool,\n"
+                "            Exception, help, dis\n"
+                "  Features: try/except/finally, with, *args, defaults, comprehensions,\n"
+                "            f-strings (AST parser), bytecode disassembler.\n"
+                "  REPL: dis(\"code\") shows bytecode; help() shows this message.\n"
+                "  CLI:  pymini --disasm -c \"...\"  or  pymini disasm \"...\""
+            )
+            return None
+        target = values[0]
+        self.stdout(f"Help on {target!r}: {type(target).__name__} object")
+        return None
+
+    def _dis(self, *values: object) -> str:
+        if not values:
+            raise PyMiniTypeError("dis() takes exactly one string argument")
+        source = values[0]
+        if not isinstance(source, str):
+            raise PyMiniTypeError("dis() argument must be a string of PyMini source")
+        from pymini.compiler.bytecode import disassemble_source
+
+        text = disassemble_source(source)
+        self.stdout(text)
+        return text
+
     def _tick(self) -> None:
         self.steps += 1
         if self.steps > self.max_steps:
-            raise PyMiniRuntimeError("execution step limit exceeded")
+            raise PyMiniRuntimeError(
+                "execution step limit exceeded", frames=self.snapshot_frames()
+            )
 
     def _binary_op(self, op: ast.operator, left: object, right: object) -> object:
         binary_ops: dict[type[ast.operator], Callable[[object, object], object]] = {
@@ -362,7 +671,13 @@ class Evaluator:
         }
         for op_type, func in binary_ops.items():
             if isinstance(op, op_type):
-                return func(left, right)
+                try:
+                    return func(left, right)
+                except Exception as exc:
+                    raise PyMiniTypeError(
+                        str(exc) or f"unsupported operand types for {op_type.__name__}",
+                        frames=self.snapshot_frames(),
+                    ) from exc
         raise PyMiniNotImplementedError(f"binary operator {op.__class__.__name__} is unsupported")
 
     def _compare(self, op: ast.cmpop, left: object, right: object) -> bool:

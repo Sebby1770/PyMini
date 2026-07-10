@@ -7,7 +7,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from pymini.runtime.errors import PyMiniRuntimeError, PyMiniTypeError, ReturnSignal
+from pymini.runtime.errors import (
+    PyMiniRuntimeError,
+    PyMiniTypeError,
+    ReturnSignal,
+)
 from pymini.runtime.scope import Environment
 
 
@@ -43,28 +47,38 @@ class MiniFunction:
             raise PyMiniRuntimeError("MiniFunction requires an Evaluator")
 
         parameters = self.declaration.args.args
-        if len(args) > len(parameters):
+        vararg = self.declaration.args.vararg
+        max_positional = len(parameters)
+        required = max_positional - len(self.defaults)
+
+        if vararg is None and len(args) > max_positional:
             raise PyMiniTypeError(
-                f"{self.name} expected at most {len(parameters)} arguments, got {len(args)}"
+                f"{self.name}() expected at most {max_positional} arguments, got {len(args)}"
+            )
+        if len(args) < required:
+            raise PyMiniTypeError(
+                f"{self.name}() expected at least {required} arguments, got {len(args)}"
             )
 
-        missing = len(parameters) - len(args)
-        if missing > len(self.defaults):
-            required = len(parameters) - len(self.defaults)
-            raise PyMiniTypeError(f"{self.name} expected at least {required} arguments")
-
-        bound = list(args)
+        bound: list[object] = list(args[:max_positional])
+        missing = max_positional - len(bound)
         if missing:
             bound.extend(self.defaults[-missing:])
 
         local = Environment(name=f"fn {self.name}", parent=self.closure)
         for parameter, value in zip(parameters, bound, strict=True):
             local.define(parameter.arg, value)
+        if vararg is not None:
+            local.define(vararg.arg, tuple(args[max_positional:]))
 
+        lineno = getattr(self.declaration, "lineno", None)
+        evaluator.push_frame(self.name, lineno=lineno)
         try:
             evaluator.eval_block(self.declaration.body, local)
         except ReturnSignal as signal:
             return signal.value
+        finally:
+            evaluator.pop_frame()
         return None
 
     def bind(self, receiver: object) -> BoundMethod:

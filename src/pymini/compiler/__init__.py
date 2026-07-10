@@ -1,6 +1,21 @@
-"""Compiler package placeholder for Milestone 2."""
+"""Compiler package: bytecode model, compiler, and disassembler."""
 
-from pymini.compiler.bytecode import Chunk, Instruction, OpCode
+from pymini.compiler.bytecode import (
+    Chunk,
+    Compiler,
+    Instruction,
+    OpCode,
+    compile_source,
+    disassemble,
+    disassemble_source,
+)
 
-__all__ = ["Chunk", "Instruction", "OpCode"]
-
+__all__ = [
+    "Chunk",
+    "Compiler",
+    "Instruction",
+    "OpCode",
+    "compile_source",
+    "disassemble",
+    "disassemble_source",
+]
