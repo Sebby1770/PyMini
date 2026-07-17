@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 if TYPE_CHECKING:
     from pymini.api import compile_source, disassemble, evaluate, parse, run_bytecode

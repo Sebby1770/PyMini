@@ -64,6 +64,13 @@ class ReturnSignal(Exception):
     value: object
 
 
+@dataclass(slots=True)
+class YieldSignal(Exception):
+    """Internal signal for yield (rarely surfaces outside generators)."""
+
+    value: object
+
+
 class BreakSignal(Exception):
     pass
 

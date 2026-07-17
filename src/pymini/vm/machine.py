@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import operator
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from pymini.compiler.bytecode import Chunk, Instruction, OpCode
@@ -63,11 +63,24 @@ class VirtualMachine:
             "range": range,
             "list": list,
             "dict": dict,
+            "set": set,
+            "tuple": tuple,
             "str": str,
             "int": int,
             "float": float,
             "bool": bool,
             "Exception": Exception,
+            "sum": sum,
+            "min": min,
+            "max": max,
+            "abs": abs,
+            "round": round,
+            "enumerate": enumerate,
+            "zip": zip,
+            "sorted": sorted,
+            "reversed": reversed,
+            "any": any,
+            "all": all,
         }
         self.frames: list[Frame] = []
 
@@ -142,6 +155,26 @@ class VirtualMachine:
             stack.append(left / right)  # type: ignore[operator]
             return _CONTINUE
 
+        if op is OpCode.BINARY_MOD:
+            right, left = stack.pop(), stack.pop()
+            stack.append(left % right)  # type: ignore[operator]
+            return _CONTINUE
+
+        if op is OpCode.BINARY_POW:
+            right, left = stack.pop(), stack.pop()
+            stack.append(left**right)  # type: ignore[operator]
+            return _CONTINUE
+
+        if op is OpCode.UNARY_NEGATIVE:
+            value = stack.pop()
+            stack.append(-value)  # type: ignore[operator]
+            return _CONTINUE
+
+        if op is OpCode.UNARY_NOT:
+            value = stack.pop()
+            stack.append(not value)
+            return _CONTINUE
+
         if op is OpCode.COMPARE_OP:
             right, left = stack.pop(), stack.pop()
             func = COMPARE_FUNCS.get(str(instr.operand))
@@ -159,6 +192,33 @@ class VirtualMachine:
             assert isinstance(instr.operand, int)
             value = stack.pop()
             if not value:
+                frame.ip = instr.operand
+            return _CONTINUE
+
+        if op is OpCode.JUMP_IF_TRUE:
+            assert isinstance(instr.operand, int)
+            value = stack.pop()
+            if value:
+                frame.ip = instr.operand
+            return _CONTINUE
+
+        if op is OpCode.GET_ITER:
+            value = stack.pop()
+            try:
+                stack.append(iter(value))  # type: ignore[call-overload]
+            except TypeError as exc:
+                raise PyMiniTypeError(f"{value!r} is not iterable") from exc
+            return _CONTINUE
+
+        if op is OpCode.FOR_ITER:
+            assert isinstance(instr.operand, int)
+            iterator = stack[-1]
+            if not isinstance(iterator, Iterator) and not hasattr(iterator, "__next__"):
+                raise PyMiniTypeError(f"{iterator!r} is not an iterator")
+            try:
+                stack.append(next(iterator))  # type: ignore[call-overload]
+            except StopIteration:
+                stack.pop()  # drop iterator
                 frame.ip = instr.operand
             return _CONTINUE
 
@@ -192,6 +252,13 @@ class VirtualMachine:
             count = instr.operand
             items = [stack.pop() for _ in range(count)][::-1]
             stack.append(tuple(items))
+            return _CONTINUE
+
+        if op is OpCode.BUILD_SET:
+            assert isinstance(instr.operand, int)
+            count = instr.operand
+            items = [stack.pop() for _ in range(count)][::-1]
+            stack.append(set(items))
             return _CONTINUE
 
         if op is OpCode.BUILD_DICT:
