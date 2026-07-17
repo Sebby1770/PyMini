@@ -12,7 +12,7 @@ from pymini.runtime.errors import PyMiniNotImplementedError, PyMiniSyntaxError
 
 
 class OpCode(Enum):
-    """Minimal educational instruction set."""
+    """Educational instruction set for the PyMini VM."""
 
     LOAD_CONST = auto()
     LOAD_NAME = auto()
@@ -22,15 +22,23 @@ class OpCode(Enum):
     BINARY_SUB = auto()
     BINARY_MUL = auto()
     BINARY_DIV = auto()
+    BINARY_MOD = auto()
+    BINARY_POW = auto()
+    UNARY_NEGATIVE = auto()
+    UNARY_NOT = auto()
     COMPARE_OP = auto()
     JUMP = auto()
     JUMP_IF_FALSE = auto()
+    JUMP_IF_TRUE = auto()
+    GET_ITER = auto()
+    FOR_ITER = auto()
     RETURN_VALUE = auto()
     CALL = auto()
     MAKE_FUNCTION = auto()
     BUILD_LIST = auto()
     BUILD_TUPLE = auto()
     BUILD_DICT = auto()
+    BUILD_SET = auto()
 
 
 # Compare operator names used as COMPARE_OP operands.
@@ -52,6 +60,8 @@ BINARY_OPS = {
     ast.Sub: OpCode.BINARY_SUB,
     ast.Mult: OpCode.BINARY_MUL,
     ast.Div: OpCode.BINARY_DIV,
+    ast.Mod: OpCode.BINARY_MOD,
+    ast.Pow: OpCode.BINARY_POW,
 }
 
 
@@ -99,10 +109,12 @@ def disassemble(chunk: Chunk) -> str:
             params.append(f"*{chunk.vararg}")
         lines.append(f"  args: ({', '.join(params)})")
     if chunk.constants:
-        const_repr = ", ".join(repr(c) if not isinstance(c, Chunk) else f"<chunk {c.name!r}>"
-                               for c in chunk.constants)
+        const_repr = ", ".join(
+            repr(c) if not isinstance(c, Chunk) else f"<chunk {c.name!r}>" for c in chunk.constants
+        )
         lines.append(f"  constants: [{const_repr}]")
     width = max(len(str(len(chunk.instructions) - 1)), 1) if chunk.instructions else 1
+    jump_ops = {OpCode.JUMP, OpCode.JUMP_IF_FALSE, OpCode.JUMP_IF_TRUE, OpCode.FOR_ITER}
     for index, instr in enumerate(chunk.instructions):
         line_col = f"L{instr.line}" if instr.line is not None else "   "
         op_name = instr.opcode.name
@@ -112,7 +124,7 @@ def disassemble(chunk: Chunk) -> str:
                 detail = f"{instr.operand} ({const.name!r} code)"
             else:
                 detail = f"{instr.operand} ({const!r})"
-        elif instr.opcode in (OpCode.JUMP, OpCode.JUMP_IF_FALSE):
+        elif instr.opcode in jump_ops:
             detail = f"-> {instr.operand}"
         elif instr.operand is None:
             detail = ""
@@ -120,7 +132,8 @@ def disassemble(chunk: Chunk) -> str:
             detail = repr(instr.operand) if not isinstance(instr.operand, str) else instr.operand
             if instr.opcode is OpCode.COMPARE_OP:
                 detail = str(instr.operand)
-            elif instr.opcode is OpCode.CALL:
+            elif instr.opcode in (OpCode.CALL, OpCode.BUILD_LIST, OpCode.BUILD_TUPLE,
+                                  OpCode.BUILD_DICT, OpCode.BUILD_SET):
                 detail = str(instr.operand)
         operand_text = f" {detail}" if detail != "" else ""
         lines.append(f"{index:>{width}}  {line_col:>4}  {op_name}{operand_text}")
@@ -211,6 +224,23 @@ class Compiler:
             self.emit(OpCode.JUMP, loop_start, line=line)
             self.chunk.patch_jump(jump_exit)
             return
+        if isinstance(node, ast.For):
+            # for target in iter: body
+            #   iter; GET_ITER; FOR_ITER end; STORE target; body; JUMP loop; end:
+            if not isinstance(node.target, ast.Name):
+                raise PyMiniNotImplementedError(
+                    "bytecode for-loops only support simple name targets"
+                )
+            self.compile_expr(node.iter)
+            self.emit(OpCode.GET_ITER, line=line)
+            loop_start = len(self.chunk.instructions)
+            for_exit = self.emit(OpCode.FOR_ITER, 0, line=line)
+            self.emit(OpCode.STORE_NAME, node.target.id, line=line)
+            for stmt in node.body:
+                self.compile_stmt(stmt)
+            self.emit(OpCode.JUMP, loop_start, line=line)
+            self.chunk.patch_jump(for_exit)
+            return
         if isinstance(node, ast.FunctionDef):
             if node.args.kwonlyargs or node.args.kwarg or node.args.posonlyargs:
                 raise PyMiniNotImplementedError(
@@ -250,11 +280,21 @@ class Compiler:
             self.compile_expr(node.right)
             self.emit(opcode, line=line)
             return
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-            self.emit_const(0, line=line)
-            self.compile_expr(node.operand)
-            self.emit(OpCode.BINARY_SUB, line=line)
-            return
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.USub):
+                self.compile_expr(node.operand)
+                self.emit(OpCode.UNARY_NEGATIVE, line=line)
+                return
+            if isinstance(node.op, ast.Not):
+                self.compile_expr(node.operand)
+                self.emit(OpCode.UNARY_NOT, line=line)
+                return
+            if isinstance(node.op, ast.UAdd):
+                self.compile_expr(node.operand)
+                return
+            raise PyMiniNotImplementedError(
+                f"bytecode compiler does not support unary {node.op.__class__.__name__}"
+            )
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
                 raise PyMiniNotImplementedError(
@@ -286,6 +326,11 @@ class Compiler:
             for elt in node.elts:
                 self.compile_expr(elt)
             self.emit(OpCode.BUILD_TUPLE, len(node.elts), line=line)
+            return
+        if isinstance(node, ast.Set):
+            for elt in node.elts:
+                self.compile_expr(elt)
+            self.emit(OpCode.BUILD_SET, len(node.elts), line=line)
             return
         if isinstance(node, ast.Dict):
             count = 0

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import operator
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Literal
 
 from pymini.optimizer.ast_optimizer import optimize_module
@@ -24,6 +24,7 @@ from pymini.runtime.objects import (
     BoundMethod,
     MiniClass,
     MiniFunction,
+    MiniGenerator,
     MiniInstance,
     ModuleNamespace,
     NativeFunction,
@@ -33,6 +34,13 @@ from pymini.runtime.scope import Environment
 from pymini.stdlib.modules import StandardLibrary
 
 _CONTROL_FLOW = (ReturnSignal, BreakSignal, ContinueSignal)
+
+
+def _node_contains_yield(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, (ast.Yield, ast.YieldFrom)):
+            return True
+    return False
 
 
 class Evaluator:
@@ -45,16 +53,23 @@ class Evaluator:
         stdout: Callable[[str], None] | None = None,
         max_steps: int = 100_000,
         filename: str = "<string>",
+        trace: bool = False,
+        on_line: Callable[[int, str | None], None] | None = None,
     ) -> None:
         self.stdlib = stdlib or StandardLibrary()
         self.stdout = stdout or print
         self.max_steps = max_steps
         self.steps = 0
         self.filename = filename
+        self.trace = trace
+        self.on_line = on_line
+        self._last_traced_line: int | None = None
         self.global_env = Environment(name="global")
         self.frames: list[TracebackFrame] = [
             TracebackFrame(name="<module>", filename=filename, lineno=1)
         ]
+        # Current environment for debugger inspection.
+        self.current_env: Environment = self.global_env
         self._install_builtins()
 
     def push_frame(self, name: str, lineno: int | None = None) -> None:
@@ -74,6 +89,13 @@ class Evaluator:
         lineno = getattr(node, "lineno", None)
         if lineno is not None and self.frames:
             self.frames[-1].lineno = lineno
+        if lineno is not None and (self.trace or self.on_line is not None):
+            if lineno != self._last_traced_line:
+                self._last_traced_line = lineno
+                if self.trace:
+                    self.stdout(f"  --> {self.filename}:{lineno}")
+                if self.on_line is not None:
+                    self.on_line(lineno, self.frames[-1].name if self.frames else None)
 
     def _attach_frames(self, exc: BaseException) -> BaseException:
         if isinstance(exc, PyMiniError):
@@ -99,6 +121,7 @@ class Evaluator:
         self._tick()
         self._set_lineno(node)
         scope = env or self.global_env
+        self.current_env = scope
         method_name = f"eval_{node.__class__.__name__}"
         method = getattr(self, method_name, None)
         if method is None:
@@ -122,6 +145,144 @@ class Evaluator:
             result = self.eval(statement, env)
         return result
 
+    # --- Generator evaluation path -------------------------------------------------
+
+    def gen_eval_block(
+        self, statements: Sequence[ast.stmt], env: Environment
+    ) -> Iterator[object]:
+        for statement in statements:
+            yield from self.gen_eval_stmt(statement, env)
+
+    def gen_eval_stmt(self, node: ast.stmt, env: Environment) -> Iterator[object]:
+        """Yield values from ``yield`` expressions inside a generator body."""
+
+        self._tick()
+        self._set_lineno(node)
+        self.current_env = env
+
+        if isinstance(node, ast.Expr):
+            if isinstance(node.value, ast.Yield):
+                value = None if node.value.value is None else self.eval(node.value.value, env)
+                yield value
+                return
+            if isinstance(node.value, ast.YieldFrom):
+                iterable = self.eval(node.value.value, env)
+                if not isinstance(iterable, Iterable):
+                    raise PyMiniTypeError(f"object {iterable!r} is not iterable")
+                yield from iterable  # type: ignore[misc]
+                return
+            self.eval(node.value, env)
+            return
+
+        if isinstance(node, ast.Assign):
+            value = self.eval(node.value, env)
+            for target in node.targets:
+                self.assign_target(target, value, env)
+            return
+
+        if isinstance(node, ast.AugAssign):
+            self.eval(node, env)
+            return
+
+        if isinstance(node, ast.Return):
+            value = None if node.value is None else self.eval(node.value, env)
+            raise ReturnSignal(value)
+
+        if isinstance(node, ast.Break):
+            raise BreakSignal
+        if isinstance(node, ast.Continue):
+            raise ContinueSignal
+        if isinstance(node, ast.Pass):
+            return
+
+        if isinstance(node, ast.If):
+            branch = node.body if self._truthy(self.eval(node.test, env)) else node.orelse
+            yield from self.gen_eval_block(branch, env)
+            return
+
+        if isinstance(node, ast.While):
+            while self._truthy(self.eval(node.test, env)):
+                try:
+                    yield from self.gen_eval_block(node.body, env)
+                except ContinueSignal:
+                    continue
+                except BreakSignal:
+                    break
+            return
+
+        if isinstance(node, ast.For):
+            iterable = self.eval(node.iter, env)
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"object {iterable!r} is not iterable")
+            for item in iterable:
+                self.assign_target(node.target, item, env)
+                try:
+                    yield from self.gen_eval_block(node.body, env)
+                except ContinueSignal:
+                    continue
+                except BreakSignal:
+                    break
+            return
+
+        if isinstance(node, ast.Try):
+            # Minimal try support inside generators.
+            pending: BaseException | None = None
+            try:
+                try:
+                    yield from self.gen_eval_block(node.body, env)
+                except _CONTROL_FLOW:
+                    raise
+                except Exception as exc:
+                    handled = False
+                    for handler in node.handlers:
+                        if self._exception_matches(handler, exc, env):
+                            if handler.name:
+                                env.define(handler.name, exc)
+                            try:
+                                yield from self.gen_eval_block(handler.body, env)
+                            finally:
+                                if handler.name:
+                                    env.values.pop(handler.name, None)
+                            handled = True
+                            break
+                    if not handled:
+                        pending = exc
+                else:
+                    if pending is None and node.orelse:
+                        yield from self.gen_eval_block(node.orelse, env)
+            finally:
+                if node.finalbody:
+                    yield from self.gen_eval_block(node.finalbody, env)
+            if pending is not None:
+                raise pending
+            return
+
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+            self.eval(node, env)
+            return
+
+        if isinstance(node, ast.Assert):
+            self.eval(node, env)
+            return
+
+        if isinstance(node, ast.Raise):
+            self.eval(node, env)
+            return
+
+        if isinstance(node, ast.With):
+            # Fall back to non-generator with for simplicity.
+            self.eval(node, env)
+            return
+
+        # Default: evaluate as a normal statement (no yields expected).
+        if _node_contains_yield(node):
+            raise PyMiniNotImplementedError(
+                f"yield inside {node.__class__.__name__} is not supported yet"
+            )
+        self.eval(node, env)
+
+    # --- Statements ----------------------------------------------------------------
+
     def eval_Module(self, node: ast.Module, env: Environment) -> object:
         return self.eval_block(node.body, env)
 
@@ -142,6 +303,14 @@ class Evaluator:
             self.assign_target(target, value, env)
         return value
 
+    def eval_AnnAssign(self, node: ast.AnnAssign, env: Environment) -> object:
+        if node.value is None:
+            return None
+        value = self.eval(node.value, env)
+        if node.target is not None:
+            self.assign_target(node.target, value, env)
+        return value
+
     def eval_AugAssign(self, node: ast.AugAssign, env: Environment) -> object:
         current = self.load_target(node.target, env)
         value = self._binary_op(node.op, current, self.eval(node.value, env))
@@ -155,11 +324,32 @@ class Evaluator:
         value = None if node.value is None else self.eval(node.value, env)
         raise ReturnSignal(value)
 
+    def eval_Yield(self, node: ast.Yield, env: Environment) -> object:
+        # Bare yield expressions outside the generator driver are not supported.
+        raise PyMiniRuntimeError(
+            "'yield' outside function",
+            frames=self.snapshot_frames(),
+        )
+
+    def eval_YieldFrom(self, node: ast.YieldFrom, env: Environment) -> object:
+        raise PyMiniRuntimeError(
+            "'yield from' outside function",
+            frames=self.snapshot_frames(),
+        )
+
     def eval_Break(self, node: ast.Break, env: Environment) -> object:
         raise BreakSignal
 
     def eval_Continue(self, node: ast.Continue, env: Environment) -> object:
         raise ContinueSignal
+
+    def eval_Assert(self, node: ast.Assert, env: Environment) -> object:
+        if not self._truthy(self.eval(node.test, env)):
+            if node.msg is not None:
+                msg = self.eval(node.msg, env)
+                raise AssertionError(msg)
+            raise AssertionError
+        return None
 
     def eval_If(self, node: ast.If, env: Environment) -> object:
         branch = node.body if self._truthy(self.eval(node.test, env)) else node.orelse
@@ -192,13 +382,45 @@ class Evaluator:
         return result
 
     def eval_FunctionDef(self, node: ast.FunctionDef, env: Environment) -> object:
-        if node.args.kwarg or node.args.kwonlyargs or node.args.posonlyargs:
-            raise PyMiniNotImplementedError(
-                "only positional parameters and *args are supported"
-            )
+        if node.args.posonlyargs:
+            raise PyMiniNotImplementedError("positional-only parameters are not supported yet")
         defaults = tuple(self.eval(default, env) for default in node.args.defaults)
-        function = MiniFunction(node.name, node, env, defaults)
+        kw_defaults: list[object | None] = []
+        for default in node.args.kw_defaults:
+            if default is None:
+                kw_defaults.append(None)
+            else:
+                kw_defaults.append(self.eval(default, env))
+        function = MiniFunction.from_function_def(
+            node, env, defaults, tuple(kw_defaults)
+        )
         return env.define(node.name, function)
+
+    def eval_Lambda(self, node: ast.Lambda, env: Environment) -> object:
+        if node.args.posonlyargs:
+            raise PyMiniNotImplementedError("positional-only parameters are not supported yet")
+        defaults = tuple(self.eval(default, env) for default in node.args.defaults)
+        kw_defaults: list[object | None] = []
+        for default in node.args.kw_defaults:
+            if default is None:
+                kw_defaults.append(None)
+            else:
+                kw_defaults.append(self.eval(default, env))
+        # Synthesize a FunctionDef so MiniFunction can evaluate a return body.
+        ret = ast.Return(value=node.body)
+        ast.copy_location(ret, node)
+        func_def = ast.FunctionDef(
+            name="<lambda>",
+            args=node.args,
+            body=[ret],
+            decorator_list=[],
+            returns=None,
+            type_comment=None,
+        )
+        ast.copy_location(func_def, node)
+        return MiniFunction.from_function_def(
+            func_def, env, defaults, tuple(kw_defaults)
+        )
 
     def eval_ClassDef(self, node: ast.ClassDef, env: Environment) -> object:
         if node.keywords:
@@ -371,6 +593,7 @@ class Evaluator:
             ast.UAdd: operator.pos,
             ast.USub: operator.neg,
             ast.Not: lambda item: not self._truthy(item),
+            ast.Invert: operator.invert,
         }
         for op_type, func in unary_ops.items():
             if isinstance(node.op, op_type):
@@ -517,8 +740,6 @@ class Evaluator:
         return self.get_attribute(self.eval(node.value, env), node.attr)
 
     def eval_Call(self, node: ast.Call, env: Environment) -> object:
-        if node.keywords:
-            raise PyMiniNotImplementedError("keyword arguments are not supported yet")
         callee = self.eval(node.func, env)
         args: list[object] = []
         for arg in node.args:
@@ -529,7 +750,28 @@ class Evaluator:
                 args.extend(list(starred))
             else:
                 args.append(self.eval(arg, env))
-        return self.call_value(callee, args)
+
+        kwargs: dict[str, object] = {}
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                # **mapping
+                mapping = self.eval(keyword.value, env)
+                if not isinstance(mapping, Mapping):
+                    raise PyMiniTypeError(f"{mapping!r} is not a mapping")
+                for key, value in mapping.items():
+                    if not isinstance(key, str):
+                        raise PyMiniTypeError("keywords must be strings")
+                    if key in kwargs:
+                        raise PyMiniTypeError(f"got multiple values for keyword argument {key!r}")
+                    kwargs[key] = value
+            else:
+                if keyword.arg in kwargs:
+                    raise PyMiniTypeError(
+                        f"got multiple values for keyword argument {keyword.arg!r}"
+                    )
+                kwargs[keyword.arg] = self.eval(keyword.value, env)
+
+        return self.call_value(callee, args, kwargs)
 
     def eval_Starred(self, node: ast.Starred, env: Environment) -> object:
         raise PyMiniTypeError("starred expression is not allowed here")
@@ -588,52 +830,222 @@ class Evaluator:
     def set_attribute(self, value: object, name: str, assigned: object) -> object:
         if isinstance(value, MiniInstance | MiniClass):
             return value.set_attr(name, assigned)
-        raise PyMiniTypeError(f"cannot set attribute {name!r} on {value!r}")
+        try:
+            setattr(value, name, assigned)
+            return assigned
+        except Exception as exc:
+            raise PyMiniTypeError(f"cannot set attribute {name!r} on {value!r}") from exc
 
-    def call_value(self, callee: object, args: Sequence[object]) -> object:
+    def call_value(
+        self,
+        callee: object,
+        args: Sequence[object],
+        kwargs: Mapping[str, object] | None = None,
+    ) -> object:
+        kwargs = kwargs or {}
         if isinstance(callee, MiniFunction | BoundMethod | MiniClass | NativeFunction):
-            return callee.call(args, self)
+            return callee.call(args, self, kwargs)
         if isinstance(callee, SupportsCall):
-            return callee.call(args, self)
+            return callee.call(args, self, kwargs)
         if callable(callee):
+            if kwargs:
+                return callee(*args, **dict(kwargs))
             return callee(*args)
         raise PyMiniTypeError(f"object {callee!r} is not callable")
 
     def _install_builtins(self) -> None:
-        self.global_env.define("print", NativeFunction("print", self._print))
-        self.global_env.define("len", NativeFunction("len", len))
-        self.global_env.define("range", NativeFunction("range", range))
-        self.global_env.define("list", NativeFunction("list", list))
-        self.global_env.define("dict", NativeFunction("dict", dict))
-        self.global_env.define("set", NativeFunction("set", set))
-        self.global_env.define("tuple", NativeFunction("tuple", tuple))
-        self.global_env.define("str", NativeFunction("str", str))
-        self.global_env.define("int", NativeFunction("int", int))
-        self.global_env.define("float", NativeFunction("float", float))
-        self.global_env.define("bool", NativeFunction("bool", bool))
-        self.global_env.define("Exception", Exception)
-        self.global_env.define("ValueError", ValueError)
-        self.global_env.define("TypeError", TypeError)
-        self.global_env.define("RuntimeError", RuntimeError)
-        self.global_env.define("ZeroDivisionError", ZeroDivisionError)
-        self.global_env.define("help", NativeFunction("help", self._help))
-        self.global_env.define("dis", NativeFunction("dis", self._dis))
+        def _print(*values: object) -> None:
+            self.stdout(" ".join(str(value) for value in values))
+            return None
 
-    def _print(self, *values: object) -> None:
-        self.stdout(" ".join(str(value) for value in values))
-        return None
+        def _map(func: object, *iterables: object) -> list[object]:
+            # Eager map for simplicity / predictability in educational subset.
+            if not iterables:
+                raise PyMiniTypeError("map() must have at least two arguments")
+            iterators = [iter(it) for it in iterables]  # type: ignore[arg-type]
+            result: list[object] = []
+            while True:
+                try:
+                    items = [next(it) for it in iterators]
+                except StopIteration:
+                    break
+                result.append(self.call_value(func, items))
+            return result
+
+        def _filter(func: object, iterable: object) -> list[object]:
+            result: list[object] = []
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"{iterable!r} is not iterable")
+            for item in iterable:
+                if func is None:
+                    if self._truthy(item):
+                        result.append(item)
+                elif self._truthy(self.call_value(func, [item])):
+                    result.append(item)
+            return result
+
+        def _sorted_fn(iterable: object, *, key: object = None, reverse: bool = False) -> list[object]:
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"{iterable!r} is not iterable")
+            items = list(iterable)
+            if key is None:
+                return sorted(items, reverse=bool(reverse))  # type: ignore[type-var]
+            return sorted(
+                items,
+                key=lambda item: self.call_value(key, [item]),  # type: ignore[arg-type]
+                reverse=bool(reverse),
+            )
+
+        def _min_fn(*args: object, **kwargs: object) -> object:
+            if len(args) == 1 and isinstance(args[0], Iterable) and not isinstance(args[0], (str, bytes)):
+                return min(args[0], **kwargs)  # type: ignore[call-overload]
+            return min(args, **kwargs)  # type: ignore[type-var]
+
+        def _max_fn(*args: object, **kwargs: object) -> object:
+            if len(args) == 1 and isinstance(args[0], Iterable) and not isinstance(args[0], (str, bytes)):
+                return max(args[0], **kwargs)  # type: ignore[call-overload]
+            return max(args, **kwargs)  # type: ignore[type-var]
+
+        def _sum_fn(iterable: object, start: object = 0) -> object:
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"{iterable!r} is not iterable")
+            return sum(iterable, start)  # type: ignore[call-overload]
+
+        def _any_fn(iterable: object) -> bool:
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"{iterable!r} is not iterable")
+            return any(self._truthy(item) for item in iterable)
+
+        def _all_fn(iterable: object) -> bool:
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"{iterable!r} is not iterable")
+            return all(self._truthy(item) for item in iterable)
+
+        def _reversed_fn(seq: object) -> list[object]:
+            return list(reversed(seq))  # type: ignore[call-overload]
+
+        def _enumerate_fn(iterable: object, start: int = 0) -> list[tuple[int, object]]:
+            if not isinstance(iterable, Iterable):
+                raise PyMiniTypeError(f"{iterable!r} is not iterable")
+            return list(enumerate(iterable, start=start))
+
+        def _zip_fn(*iterables: object) -> list[tuple[object, ...]]:
+            return list(zip(*iterables, strict=False))  # type: ignore[arg-type]
+
+        def _isinstance_fn(obj: object, classinfo: object) -> bool:
+            if isinstance(classinfo, tuple):
+                return any(_isinstance_fn(obj, item) for item in classinfo)
+            if isinstance(classinfo, MiniClass):
+                if isinstance(obj, MiniInstance):
+                    current: MiniClass | None = obj.klass
+                    while current is not None:
+                        if current is classinfo:
+                            return True
+                        current = current.bases[0] if current.bases else None
+                    return False
+                return False
+            if isinstance(classinfo, type):
+                return isinstance(obj, classinfo)
+            raise PyMiniTypeError("isinstance() arg 2 must be a type or tuple of types")
+
+        def _type_fn(obj: object) -> object:
+            if isinstance(obj, MiniInstance):
+                return obj.klass
+            if isinstance(obj, MiniClass):
+                return type
+            return type(obj)
+
+        def _hasattr_fn(obj: object, name: object) -> bool:
+            if not isinstance(name, str):
+                raise PyMiniTypeError("hasattr(): attribute name must be string")
+            try:
+                self.get_attribute(obj, name)
+                return True
+            except Exception:
+                return False
+
+        def _getattr_fn(obj: object, name: object, default: object = _MISSING) -> object:
+            if not isinstance(name, str):
+                raise PyMiniTypeError("getattr(): attribute name must be string")
+            try:
+                return self.get_attribute(obj, name)
+            except Exception:
+                if default is not _MISSING:
+                    return default
+                raise
+
+        def _setattr_fn(obj: object, name: object, value: object) -> None:
+            if not isinstance(name, str):
+                raise PyMiniTypeError("setattr(): attribute name must be string")
+            self.set_attribute(obj, name, value)
+            return None
+
+        def _abs_fn(x: object) -> object:
+            return abs(x)  # type: ignore[arg-type]
+
+        def _round_fn(number: object, ndigits: object | None = None) -> object:
+            if ndigits is None:
+                return round(number)  # type: ignore[call-overload]
+            return round(number, ndigits)  # type: ignore[call-overload]
+
+        # Use real types for int/str/... so isinstance/type work naturally.
+        builtins: dict[str, object] = {
+            "print": NativeFunction("print", _print),
+            "len": NativeFunction("len", len),
+            "range": NativeFunction("range", range),
+            "list": list,
+            "dict": dict,
+            "set": set,
+            "tuple": tuple,
+            "str": str,
+            "int": int,
+            "float": float,
+            "bool": bool,
+            "enumerate": NativeFunction("enumerate", _enumerate_fn),
+            "zip": NativeFunction("zip", _zip_fn),
+            "map": NativeFunction("map", _map),
+            "filter": NativeFunction("filter", _filter),
+            "sorted": NativeFunction("sorted", _sorted_fn),
+            "reversed": NativeFunction("reversed", _reversed_fn),
+            "sum": NativeFunction("sum", _sum_fn),
+            "min": NativeFunction("min", _min_fn),
+            "max": NativeFunction("max", _max_fn),
+            "any": NativeFunction("any", _any_fn),
+            "all": NativeFunction("all", _all_fn),
+            "abs": NativeFunction("abs", _abs_fn),
+            "round": NativeFunction("round", _round_fn),
+            "isinstance": NativeFunction("isinstance", _isinstance_fn),
+            "type": NativeFunction("type", _type_fn),
+            "hasattr": NativeFunction("hasattr", _hasattr_fn),
+            "getattr": NativeFunction("getattr", _getattr_fn),
+            "setattr": NativeFunction("setattr", _setattr_fn),
+            "Exception": Exception,
+            "ValueError": ValueError,
+            "TypeError": TypeError,
+            "RuntimeError": RuntimeError,
+            "ZeroDivisionError": ZeroDivisionError,
+            "AssertionError": AssertionError,
+            "StopIteration": StopIteration,
+            "help": NativeFunction("help", self._help),
+            "dis": NativeFunction("dis", self._dis),
+        }
+        for name, value in builtins.items():
+            self.global_env.define(name, value)
 
     def _help(self, *values: object) -> None:
         if not values:
             self.stdout(
                 "PyMini help\n"
                 "  evaluate expressions, define functions/classes, use control flow.\n"
-                "  Builtins: print, len, range, list, dict, set, str, int, float, bool,\n"
-                "            Exception, help, dis\n"
-                "  Features: try/except/finally, with, *args, defaults, comprehensions,\n"
+                "  Builtins: print, len, range, list/dict/set/tuple, str/int/float/bool,\n"
+                "            enumerate, zip, map, filter, sorted, reversed, sum, min, max,\n"
+                "            any, all, abs, round, isinstance, type, hasattr/getattr/setattr,\n"
+                "            Exception, AssertionError, help, dis\n"
+                "  Features: lambda, assert, kwargs/**kwargs, yield/generators,\n"
+                "            try/except/finally, with, *args, defaults, comprehensions,\n"
                 "            f-strings (AST parser), bytecode disassembler.\n"
                 "  REPL: dis(\"code\") shows bytecode; help() shows this message.\n"
-                "  CLI:  pymini --disasm -c \"...\"  or  pymini disasm \"...\""
+                "  CLI:  pymini run file.py | eval -c '...' | disasm | repl | version | debug"
             )
             return None
         target = values[0]
@@ -668,6 +1080,11 @@ class Evaluator:
             ast.FloorDiv: operator.floordiv,
             ast.Mod: operator.mod,
             ast.Pow: operator.pow,
+            ast.BitAnd: operator.and_,
+            ast.BitOr: operator.or_,
+            ast.BitXor: operator.xor,
+            ast.LShift: operator.lshift,
+            ast.RShift: operator.rshift,
         }
         for op_type, func in binary_ops.items():
             if isinstance(op, op_type):
@@ -701,3 +1118,10 @@ class Evaluator:
     @staticmethod
     def _truthy(value: object) -> bool:
         return bool(value)
+
+
+class _Missing:
+    """Sentinel for getattr default."""
+
+
+_MISSING = _Missing()

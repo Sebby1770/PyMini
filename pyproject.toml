@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymini"
-version = "0.2.0"
+version = "0.3.0"
 description = "A production-quality mini-Python interpreter built as an educational VM project."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "PyMini Contributors", email = "dev@example.com" }]
+license = { text = "MIT" }
 dependencies = [
     "prompt-toolkit>=3.0.43",
     "pygments>=2.17.2",
@@ -50,7 +51,7 @@ packages = ["pymini"]
 # Poetry remains optional for local workflows that prefer it.
 [tool.poetry]
 name = "pymini"
-version = "0.2.0"
+version = "0.3.0"
 description = "A production-quality mini-Python interpreter built as an educational VM project."
 authors = ["PyMini Contributors <dev@example.com>"]
 readme = "README.md"
